@@ -32,6 +32,10 @@ class ErrorCode(str, Enum):
     MFA_RATE_LIMITED = "mfa_rate_limited"
     MFA_LOCKED = "mfa_locked"
 
+    # step-up reauthentication for sensitive operations
+    REAUTH_REQUIRED = "reauth_required"
+    REAUTH_CODE_REUSED = "reauth_code_reused"
+
     # authorization
     FORBIDDEN = "forbidden"
     NOT_FOUND = "not_found"

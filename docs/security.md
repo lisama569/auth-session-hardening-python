@@ -139,13 +139,115 @@ credential_scopes)` 是**唯一**判定函数，HTTP 入口与会话服务
 对应能力（测试 `test_permission_change_takes_effect_for_outstanding_tokens`），
 无需吊销凭据即可止血；凭据吊销（版本/密钥/登出）则作为独立机制存在。
 
+## 3.5 多设备会话管理
+
+会话创建时记录稳定标识 `sess_<random>`、登录来源 `source` 与建立时间
+`created_at`；会话结构另带 `last_reauth_at`（再认证新鲜度，见 3.6）。
+
+### 3.5.1 列举（`GET /auth/sessions`）
+
+- 必须持有效 access token；只返回该账号**未被吊销**的会话，按建立时间升序。
+- 每条包含 `session_id / source / created_at / last_reauth_at / current`；
+  `current` 标记**本次请求所用**的会话。标识是可被后续请求点名引用的稳定
+  字符串，换一台设备查看时同一标识不变、只是 `current` 视角切换。
+
+### 3.5.2 按标识下线单个会话（`POST /auth/sessions/revoke`）
+
+`Store.terminate_session(session_id, user_id, reason, now)` 在存储层同一把
+锁内一次完成：
+
+1. 会话存在、归属调用者且尚未吊销，否则返回 `False`（无副作用）；
+2. 置 `revoked=True`、记录 `revoked_reason=session_revoked_by_owner`；
+3. `token_version += 1`——该会话此前签发的 access 在下一次
+   `authenticate` 时因版本不一致立刻报 `access_token_revoked`；
+4. 该会话名下全部 refresh 记录置 `REVOKED`（含当前家族与历史家族），
+   再拿 refresh 来请求报 `refresh_token_revoked`。
+
+未被点名的会话（同账号的其它设备、其它账号）记录一概不触碰。
+
+### 3.5.3 退出其他所有设备（`POST /auth/sessions/revoke-others`）
+
+`Store.terminate_other_sessions(keep_session_id, user_id, ...)` 原子地批量
+终止调用者除当前会话外的所有有效会话：当前会话的 `token_version`
+**不变**，其 access/refresh 之后照常可用；被终止会话的 refresh 记录
+全部置 `REVOKED`。批量过程对每个会话的效果与 3.5.2 完全相同。
+
+### 3.5.4 归属与存在性隐藏（与统一授权口径一致）
+
+单个下线入口对三类输入——会话标识不存在、属于他人、已被吊销——对外
+返回**同一个** `404 {"error":"not_found"}`，无法据此外推会话是否存在；
+区分依据 `session_missing / foreign_session / already_revoked` 只写进
+服务端结构化日志。列举入口天然只暴露本人会话；「退出其他设备」只按
+存储中的归属关系批量选取，不接受外部传入的会话标识。
+
+### 3.5.5 下线与刷新交错并发
+
+刷新在 claim 之后、提交之前存在一个窗口；若会话恰在该窗口内被下线：
+
+- `terminate_session` / `terminate_other_sessions` 已把相关 refresh 记录
+  置 `REVOKED`，获胜中的 `replace_refresh` 提交会因状态不再可交换而失败；
+- 会话层把该 `LookupError` 收敛为可区分结果：会话已吊销 →
+  `session_revoked`，否则 `refresh_token_revoked`，claim 一定被释放，
+  绝不会签发「孤儿新凭据」。
+
+测试用既有的 `BarrierService` 钩子确定性地把刷新钉在该窗口，再从另一台
+设备执行单个/批量下线，断言刷新被拒、目标凭据全死、当前会话继续可用、
+存储中没有残留活跃凭据（`test_terminate_*_during_inflight_refresh`）。
+
+## 3.6 敏感操作再认证（step-up）
+
+「退出其他所有设备」属于高风险操作，仅凭一张尚未过期的 access 凭据
+不放行。规则由 `SessionService(reauth_window=...)` 配置，默认 300 秒。
+
+### 3.6.1 新鲜度模型
+
+- 新鲜度按**会话**记录：`SessionRecord.last_reauth_at`。登录时完成的
+  MFA **不**写入该字段（登录验证与敏感操作再认证是两件事）。
+- 窗口为半开区间 **`[t0, t0 + window)`**：`now < t0 + window` 视为新鲜；
+  **恰在 `t0 + window` 即过期**，必须重新再认证。边界由注入时钟驱动，
+  测试精确断言「差 1ms 放行 / 恰在边界拒绝 / 过 1ms 拒绝」。
+- 顺延（sliding）：窗口内再次验证成功，以**最新一次成功时间**重开窗口；
+  仅执行敏感操作（不带新口令）不顺延。
+- 超窗结果为独立错误码 `reauth_required`（HTTP 403），与「口令错误」
+  `totp_invalid`(400)、「时钟偏差」`totp_clock_skew`(400)、
+  「限流」`mfa_rate_limited`(429)、「锁定」`mfa_locked`(409) 全部不同。
+
+### 3.6.2 一次性口令不可重放
+
+- 再认证仍走 `TotpVerifier.verify`，失败照常计入 `(user, source)` 的
+  限流/锁定；通过后取命中的**绝对 TOTP 步号**
+  （`step_at(now) + matched_step`）。
+- `Store.consume_reauth_step(user, step, min_retained_step)` 在存储锁内
+  原子地「检查-记录」：同一用户的同一步号第二次出现即拒绝
+  `reauth_code_reused`（409），无论来自同一会话还是另一台设备。
+- 记录按用户维度（一个账号共享一个 TOTP 密钥），并按
+  `now - max_skew_steps` 修剪陈旧步号，集合不会无限增长。
+- 重放被拒时**不**写 `last_reauth_at`、不改变计数窗口，状态不被污染：
+  下一周期的新口令仍可正常完成再认证。
+
+### 3.6.3 并发一致性
+
+两个请求并发使用同一口令做再认证时，步号消费是存储锁内的一次原子
+检查-更新：恰好一个成功并盖新鲜度时间戳，另一个得到
+`reauth_code_reused`。并发的多次敏感操作不会出现「本该拦住却放行」或
+窗口/计数错乱；测试 `_StepUpBarrierService` 把首个请求确定性地停在
+「口令已验证、步号尚未消费」处再放入第二个请求。
+
+### 3.6.4 入口
+
+- `POST /auth/reauthenticate`：只做一次再认证并延长本会话新鲜度，
+  不执行任何敏感动作（便于调用方先刷新再操作）；
+- `POST /auth/sessions/revoke-others`：请求体可带 `code`——带码则先
+  完成再认证（成功即顺延窗口）再批量下线；不带码则要求窗口内已有
+  新鲜再认证，否则 `reauth_required`。
+
 ## 4. 本地验证方法
 
 ```bash
 uv sync
-uv run pytest -q          # 41 个测试全部通过
+uv run pytest -q          # 62 个测试全部通过（44 个既有 + 18 个新增）
 uv run pytest -s          # 打印每个关键判定的结构化 JSON 日志
-uv run python scripts/local_demo.py   # 完整链路冒烟脚本
+uv run python scripts/local_demo.py   # 完整链路冒烟脚本（结尾含多设备管理）
 uv run uvicorn main:app --reload      # 交互式试玩：/docs
 ```
 
@@ -157,6 +259,11 @@ uv run uvicorn main:app --reload      # 交互式试玩：/docs
 {"stage":"authz.decide","decision":"not_found","resource":"docs-admin","subject":"alice","missing":["docs:write"],"basis":"scope_insufficient"}
 {"stage":"authz.scope_reconcile","decision":"persistence_wins","subject":"alice","dropped":["docs:write"],"persisted_scopes":["docs:read","profile:read"]}
 {"stage":"mfa.verify","decision":"mfa_locked","user":"alice","source":"web","failures":5,"retry_after":300.0,"code_evaluated":false}
+{"stage":"sessions.list","decision":"ok","user":"alice","current":"sess_...","count":3,"sessions":["sess_...","sess_..."]}
+{"stage":"sessions.revoke","decision":"not_found","actor":"alice","target":"sess_other","basis":"foreign_session"}
+{"stage":"reauth.verify","decision":"ok","user":"alice","source":"web","step":33333,"fresh_until":1000300.0}
+{"stage":"reauth.verify","decision":"reauth_code_reused","user":"alice","step":33333}
+{"stage":"sessions.revoke_others","decision":"ok","current":"sess_...","terminated":["sess_..."],"reauthenticated":true}
 ```
 
 测试不访问网络、不使用真实 TOTP 服务或 IdP：TOTP 由同模块的

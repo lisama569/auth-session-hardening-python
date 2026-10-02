@@ -86,6 +86,10 @@ class TotpVerifier:
         self._counters: dict[tuple[str, str], _Counter] = {}
         self._lock = threading.RLock()
 
+    @property
+    def max_skew_steps(self) -> int:
+        return self._max_skew
+
     # ---- TOTP primitives (RFC 6238 / 4226, HMAC-SHA1) ----
     def generate_secret(self) -> bytes:
         """Return a new unpadded base32-encoded TOTP secret."""
@@ -104,6 +108,12 @@ class TotpVerifier:
         if timestamp is None:
             timestamp = self._clock.now()
         return self._hotp(secret, int(timestamp // self._period))
+
+    def step_at(self, timestamp: float | None = None) -> int:
+        """Absolute TOTP step number at a timestamp (used for replay tracking)."""
+        if timestamp is None:
+            timestamp = self._clock.now()
+        return int(timestamp // self._period)
 
     def _match(self, secret: bytes, code: str, now: float) -> tuple[TotpResult | None, int | None]:
         """Return (result, matched_step). result None means fully invalid."""

@@ -14,6 +14,13 @@ Lifecycle guarantees implemented here:
   token version, killing outstanding access tokens immediately.
 * Signing-key rotation invalidates every token signed with the old key
   (``key_version_stale``).
+* Owners can list their live sessions, terminate a single one by stable
+  id, or sign out every other device; foreign/nonexistent session ids
+  are answered uniformly as ``not_found``.
+* "Sign out other devices" is a sensitive operation: it requires a
+  successful step-up TOTP within the configurable freshness window, and
+  the one-time code is atomically consumed so it can never authorize a
+  second sensitive operation.
 """
 from __future__ import annotations
 
@@ -35,6 +42,9 @@ from auth.tokens import KeyRing, TokenClaims, b64url_decode
 ACCESS_TTL_SECONDS = 300.0                    # 5 minutes
 REFRESH_TTL_SECONDS = 60.0 * 60 * 24 * 7      # 7 days
 CHALLENGE_TTL_SECONDS = 120.0                 # MFA must complete in 2 minutes
+# A sensitive operation is accepted only within this many seconds after
+# the session's latest successful step-up reauthentication.
+REAUTH_FRESHNESS_SECONDS = 300.0              # 5 minutes
 
 _TOTP_RESULT_TO_CODE = {
     TotpResult.INVALID: ErrorCode.TOTP_INVALID,
@@ -70,6 +80,23 @@ class AccessContext:
     claims: TokenClaims
 
 
+@dataclass(frozen=True)
+class SessionInfo:
+    """Public view of one live login session."""
+
+    session_id: str
+    source: str
+    created_at: float
+    last_reauth_at: float | None
+    current: bool
+
+
+@dataclass(frozen=True)
+class RevokeOthersResult:
+    terminated_session_ids: tuple[str, ...]
+    reauthenticated: bool
+
+
 class SessionService:
     def __init__(
         self,
@@ -82,6 +109,7 @@ class SessionService:
         access_ttl: float = ACCESS_TTL_SECONDS,
         refresh_ttl: float = REFRESH_TTL_SECONDS,
         challenge_ttl: float = CHALLENGE_TTL_SECONDS,
+        reauth_window: float = REAUTH_FRESHNESS_SECONDS,
         require_mfa: bool = True,
     ) -> None:
         self.store = store
@@ -92,6 +120,7 @@ class SessionService:
         self._access_ttl = access_ttl
         self._refresh_ttl = refresh_ttl
         self._challenge_ttl = challenge_ttl
+        self._reauth_window = reauth_window
         self._require_mfa = require_mfa
         self._challenges: dict[str, LoginChallenge] = {}
         self._lock = threading.RLock()
@@ -200,7 +229,7 @@ class SessionService:
 
         with self._lock:
             self._challenges.pop(challenge_id, None)
-        session = self.store.create_session(user.user_id)
+        session = self.store.create_session(user.user_id, challenge.source)
         tokens = self._issue(session)
         log_decision(
             "login.complete", "ok", user=user.user_id, source=challenge.source,
@@ -275,7 +304,24 @@ class SessionService:
                 issued_at=self._clock.now(),
                 expires_at=new_tokens.refresh_claims.exp,
             )
-            self._commit_refresh(claimed.jti, new_record)
+            try:
+                self._commit_refresh(claimed.jti, new_record)
+            except LookupError:
+                # The family/session was revoked concurrently while this
+                # refresh was in flight (e.g. "sign out other devices").
+                latest = self.store.get_session(session.session_id)
+                if latest is not None and latest.revoked:
+                    log_decision(
+                        "refresh", "session_revoked", jti=claimed.jti,
+                        family=claimed.family_id, session=session.session_id,
+                        reason=latest.revoked_reason, basis="revoked_during_inflight",
+                    )
+                    raise AuthError(code=ErrorCode.SESSION_REVOKED)
+                log_decision(
+                    "refresh", "refresh_token_revoked", jti=claimed.jti,
+                    family=claimed.family_id, basis="revoked_during_inflight",
+                )
+                raise AuthError(code=ErrorCode.REFRESH_TOKEN_REVOKED)
         except AuthError:
             # Claim stays only on success paths; release otherwise.
             self.store.clear_inflight(claimed.jti)
@@ -342,6 +388,160 @@ class SessionService:
                 return str(body.get("jti")), str(body.get("sid")), None
             except Exception:
                 return None, None, None
+
+    # ---- multi-device session management ----
+    def list_sessions(self, access_token: str) -> list[SessionInfo]:
+        """List the caller's live sessions, marking the current one."""
+        ctx = self.authenticate(access_token)
+        records = sorted(
+            self.store.list_active_sessions(ctx.user_id),
+            key=lambda r: r.created_at,
+        )
+        log_decision(
+            "sessions.list", "ok", user=ctx.user_id,
+            current=ctx.session_id, count=len(records),
+            sessions=[r.session_id for r in records],
+        )
+        return [
+            SessionInfo(
+                session_id=r.session_id,
+                source=r.source,
+                created_at=r.created_at,
+                last_reauth_at=r.last_reauth_at,
+                current=r.session_id == ctx.session_id,
+            )
+            for r in records
+        ]
+
+    def revoke_session(self, access_token: str, session_id: str) -> None:
+        """Terminate one of the caller's own sessions by stable id.
+
+        A missing id, an id owned by another user and an id already
+        revoked all surface as the same ``not_found`` — callers cannot
+        probe whether an arbitrary session id exists.
+        """
+        ctx = self.authenticate(access_token)
+        now = self._clock.now()
+        terminated = self.store.terminate_session(
+            session_id, ctx.user_id, "session_revoked_by_owner", now,
+        )
+        if not terminated:
+            # Internal basis is logged only; the external answer is uniform.
+            target = self.store.get_session(session_id)
+            if target is None:
+                basis = "session_missing"
+            elif target.user_id != ctx.user_id:
+                basis = "foreign_session"
+            else:
+                basis = "already_revoked"
+            log_decision(
+                "sessions.revoke", "not_found", actor=ctx.user_id,
+                target=session_id, basis=basis,
+            )
+            raise AuthError(code=ErrorCode.NOT_FOUND)
+        log_decision(
+            "sessions.revoke", "ok", actor=ctx.user_id, target=session_id,
+            was_current=session_id == ctx.session_id,
+        )
+
+    # ---- step-up reauthentication for sensitive operations ----
+    def reauthenticate(self, access_token: str, code: str) -> AccessContext:
+        """Perform a fresh second-factor check bound to the current session.
+
+        Success (a) extends this session's reauthentication freshness
+        window and (b) atomically consumes the presented TOTP step, so
+        the same one-time code can never authorize a second operation.
+        """
+        ctx = self.authenticate(access_token)
+        self._perform_step_up(ctx, code)
+        return ctx
+
+    def _is_reauth_fresh(self, ctx: AccessContext, now: float) -> bool:
+        """Freshness predicate with an *exclusive* upper boundary.
+
+        A step-up at ``t`` authorizes sensitive operations while
+        ``now < t + window``; at exactly ``t + window`` the freshness
+        has lapsed and a new step-up is required.
+        """
+        session = self.store.get_session(ctx.session_id)
+        if session is None or session.last_reauth_at is None:
+            return False
+        return now < session.last_reauth_at + self._reauth_window
+
+    def _reauth_about_to_consume(self, user_id: str, absolute_step: int) -> None:
+        """Hook between code verification and step consumption (tests)."""
+
+    def _perform_step_up(self, ctx: AccessContext, code: str) -> int:
+        user = self.store.get_user(ctx.user_id)
+        session = self.store.get_session(ctx.session_id)
+        if user is None or session is None or not user.totp_enrolled or user.totp_secret is None:
+            raise AuthError(code=ErrorCode.MFA_NOT_ENROLLED)
+        now = self._clock.now()
+        status = self.verifier.verify(
+            user.user_id, session.source, user.totp_secret, code,
+        )
+        if status.result is not TotpResult.OK:
+            code_err = _TOTP_RESULT_TO_CODE[status.result]
+            log_decision(
+                "reauth.verify", code_err.value, user=user.user_id,
+                source=session.source, failures=status.failures,
+                retry_after=status.retry_after,
+            )
+            raise AuthError(code=code_err)
+
+        absolute_step = self.verifier.step_at(now) + (status.matched_step or 0)
+        min_retained = self.verifier.step_at(now) - self.verifier.max_skew_steps
+        self._reauth_about_to_consume(user.user_id, absolute_step)
+        claimed = self.store.consume_reauth_step(user.user_id, absolute_step, min_retained)
+        if not claimed:
+            log_decision(
+                "reauth.verify", "reauth_code_reused", user=user.user_id,
+                source=session.source, step=absolute_step,
+            )
+            raise AuthError(code=ErrorCode.REAUTH_CODE_REUSED)
+        self.store.mark_reauthenticated(session.session_id, now)
+        log_decision(
+            "reauth.verify", "ok", user=user.user_id, source=session.source,
+            session=session.session_id, step=absolute_step,
+            fresh_until=now + self._reauth_window,
+        )
+        return absolute_step
+
+    def revoke_other_sessions(
+        self, access_token: str, code: str | None = None,
+    ) -> RevokeOthersResult:
+        """Sign out every other device (sensitive operation).
+
+        Requires a fresh step-up: either a valid ``code`` is presented
+        (verification runs first, extending the freshness window), or the
+        session has passed reauthentication within the configured window.
+        Anything else is rejected with a reason distinguishable from a
+        wrong/rate-limited/locked second factor. The current session and
+        its credentials stay fully usable.
+        """
+        ctx = self.authenticate(access_token)
+        now = self._clock.now()
+        if code is not None:
+            self._perform_step_up(ctx, code)
+            reauthed = True
+        elif self._is_reauth_fresh(ctx, now):
+            reauthed = False
+        else:
+            log_decision(
+                "sessions.revoke_others", "reauth_required", user=ctx.user_id,
+                session=ctx.session_id, window=self._reauth_window,
+            )
+            raise AuthError(code=ErrorCode.REAUTH_REQUIRED)
+
+        terminated = self.store.terminate_other_sessions(
+            ctx.session_id, ctx.user_id, "revoked_other_devices", self._clock.now(),
+        )
+        log_decision(
+            "sessions.revoke_others", "ok", user=ctx.user_id,
+            current=ctx.session_id, terminated=terminated,
+            reauthenticated=reauthed,
+        )
+        return RevokeOthersResult(tuple(terminated), reauthed)
 
     # ---- authenticate / authorize ----
     def authenticate(self, access_token: str) -> AccessContext:

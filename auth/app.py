@@ -2,12 +2,16 @@
 
 Endpoints
 ---------
-POST /auth/login/start      -> challenge
-POST /auth/login/complete   -> access + refresh tokens
-POST /auth/refresh          -> rotated token pair
+POST /auth/login/start        -> challenge
+POST /auth/login/complete     -> access + refresh tokens
+POST /auth/refresh            -> rotated token pair
 POST /auth/logout
-GET  /resources/{name}      -> protected resources (unified decision)
-POST /admin/rotate-keys     -> rotate the signing key
+GET  /auth/sessions           -> list the caller's live sessions
+POST /auth/sessions/revoke    -> terminate one session by stable id
+POST /auth/reauthenticate     -> extend sensitive-op freshness (step-up)
+POST /auth/sessions/revoke-others -> sign out all other devices (step-up)
+GET  /resources/{name}        -> protected resources (unified decision)
+POST /admin/rotate-keys       -> rotate the signing key
 
 Authorization denials for *missing* and *forbidden* resources return
 the same 404 envelope (error code included in body for local debugging);
@@ -44,6 +48,18 @@ class RefreshRequest(BaseModel):
     refresh_token: str
 
 
+class RevokeSessionRequest(BaseModel):
+    session_id: str
+
+
+class ReauthRequest(BaseModel):
+    code: str
+
+
+class RevokeOthersRequest(BaseModel):
+    code: str | None = None
+
+
 def _http_status_for(code: ErrorCode) -> int:
     if code is ErrorCode.UNAUTHENTICATED:
         return 401
@@ -54,10 +70,13 @@ def _http_status_for(code: ErrorCode) -> int:
         ErrorCode.ACCESS_TOKEN_REVOKED,
         ErrorCode.SESSION_REVOKED,
         ErrorCode.MFA_LOCKED,
+        ErrorCode.REAUTH_CODE_REUSED,
     ):
         return 409
     if code is ErrorCode.MFA_RATE_LIMITED:
         return 429
+    if code is ErrorCode.REAUTH_REQUIRED:
+        return 403
     if code is ErrorCode.REFRESH_TOKEN_EXPIRED or code is ErrorCode.ACCESS_TOKEN_EXPIRED:
         return 401
     if code in (ErrorCode.NOT_FOUND, ErrorCode.FORBIDDEN):
@@ -132,6 +151,59 @@ def build_app(service: SessionService | None = None, *, seeded: bool = True) -> 
     async def logout(body: RefreshRequest):
         service.logout(body.refresh_token)
         return {"status": "logged_out"}
+
+    def _bearer(authorization: str | None) -> str:
+        if not authorization or not authorization.lower().startswith("bearer "):
+            raise AuthError(code=ErrorCode.UNAUTHENTICATED)
+        return authorization[7:]
+
+    @app.get("/auth/sessions")
+    async def list_sessions(authorization: str | None = Header(default=None)):
+        token = _bearer(authorization)
+        sessions = service.list_sessions(token)
+        return {
+            "sessions": [
+                {
+                    "session_id": s.session_id,
+                    "source": s.source,
+                    "created_at": s.created_at,
+                    "last_reauth_at": s.last_reauth_at,
+                    "current": s.current,
+                }
+                for s in sessions
+            ],
+        }
+
+    @app.post("/auth/sessions/revoke")
+    async def revoke_session(
+        body: RevokeSessionRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        token = _bearer(authorization)
+        service.revoke_session(token, body.session_id)
+        return {"status": "revoked", "session_id": body.session_id}
+
+    @app.post("/auth/reauthenticate")
+    async def reauthenticate(
+        body: ReauthRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        token = _bearer(authorization)
+        service.reauthenticate(token, body.code)
+        return {"status": "reauthenticated"}
+
+    @app.post("/auth/sessions/revoke-others")
+    async def revoke_others(
+        body: RevokeOthersRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        token = _bearer(authorization)
+        result = service.revoke_other_sessions(token, body.code)
+        return {
+            "status": "ok",
+            "terminated_session_ids": list(result.terminated_session_ids),
+            "reauthenticated": result.reauthenticated,
+        }
 
     @app.get("/resources/{name}")
     async def get_resource(name: str, authorization: str | None = Header(default=None)):

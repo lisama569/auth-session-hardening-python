@@ -62,6 +62,37 @@ def main() -> None:
     show("logout with old-key token",
          http.post("/auth/logout", json={"refresh_token": bob["refresh_token"]}))
 
+    # 5) multi-device session management + step-up reauthentication
+    web_ch = http.post("/auth/login/start",
+                       json={"user_id": "alice", "password": "pw", "source": "web"})
+    web_code = base.totp_provisioning_code("alice")
+    web = http.post(
+        "/auth/login/complete",
+        json={"challenge_id": web_ch.json()["challenge_id"], "code": web_code},
+    ).json()
+    web_auth = {"Authorization": f"Bearer {web['access_token']}"}
+    for source in ("mobile", "cli"):
+        ch = http.post("/auth/login/start",
+                       json={"user_id": "alice", "password": "pw", "source": source})
+        c = base.totp_provisioning_code("alice")
+        show(f"login from {source}", http.post(
+            "/auth/login/complete",
+            json={"challenge_id": ch.json()["challenge_id"], "code": c}))
+
+    show("list my sessions", http.get("/auth/sessions", headers=web_auth))
+    show("sign out others without fresh MFA (403)",
+         http.post("/auth/sessions/revoke-others", json={}, headers=web_auth))
+    stepup = base.totp_provisioning_code("alice")
+    show("sign out others WITH fresh TOTP",
+         http.post("/auth/sessions/revoke-others", json={"code": stepup},
+                   headers=web_auth))
+    show("replay the same one-time code (409)",
+         http.post("/auth/sessions/revoke-others", json={"code": stepup},
+                   headers=web_auth))
+    show("sessions after sign-out", http.get("/auth/sessions", headers=web_auth))
+    show("current device still authorized",
+         http.get("/resources/docs", headers=web_auth))
+
 
 if __name__ == "__main__":
     main()
