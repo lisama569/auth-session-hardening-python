@@ -6,6 +6,10 @@ POST /auth/login/start      -> challenge
 POST /auth/login/complete   -> access + refresh tokens
 POST /auth/refresh          -> rotated token pair
 POST /auth/logout
+GET  /auth/sessions                    -> list own active sessions
+POST /auth/sessions/reauthenticate     -> step-up TOTP (freshness window)
+POST /auth/sessions/terminate          -> revoke one own session
+POST /auth/sessions/logout-others      -> revoke other own sessions (fresh MFA)
 GET  /resources/{name}      -> protected resources (unified decision)
 POST /admin/rotate-keys     -> rotate the signing key
 
@@ -44,6 +48,20 @@ class RefreshRequest(BaseModel):
     refresh_token: str
 
 
+class ReauthRequest(BaseModel):
+    code: str
+
+
+class TerminateSessionRequest(BaseModel):
+    session_id: str
+
+
+def _bearer(authorization: str | None) -> str | None:
+    if authorization and authorization.lower().startswith("bearer "):
+        return authorization[7:]
+    return None
+
+
 def _http_status_for(code: ErrorCode) -> int:
     if code is ErrorCode.UNAUTHENTICATED:
         return 401
@@ -58,9 +76,19 @@ def _http_status_for(code: ErrorCode) -> int:
         return 409
     if code is ErrorCode.MFA_RATE_LIMITED:
         return 429
+    if code in (
+        ErrorCode.REAUTH_REQUIRED,
+    ):
+        # Step-up needed: the caller is authenticated but must complete a
+        # fresh second factor before retrying the sensitive operation.
+        return 403
+    if code in (
+        ErrorCode.TOTP_REPLAY,
+    ):
+        return 409
     if code is ErrorCode.REFRESH_TOKEN_EXPIRED or code is ErrorCode.ACCESS_TOKEN_EXPIRED:
         return 401
-    if code in (ErrorCode.NOT_FOUND, ErrorCode.FORBIDDEN):
+    if code in (ErrorCode.NOT_FOUND, ErrorCode.FORBIDDEN, ErrorCode.SESSION_NOT_FOUND):
         return 404
     if code is ErrorCode.KEY_VERSION_STALE:
         return 401
@@ -135,9 +163,7 @@ def build_app(service: SessionService | None = None, *, seeded: bool = True) -> 
 
     @app.get("/resources/{name}")
     async def get_resource(name: str, authorization: str | None = Header(default=None)):
-        token = None
-        if authorization and authorization.lower().startswith("bearer "):
-            token = authorization[7:]
+        token = _bearer(authorization)
         ctx = service.authorize_request(name, token)
         user = service.store.get_user(ctx.user_id)
         return {
@@ -146,6 +172,47 @@ def build_app(service: SessionService | None = None, *, seeded: bool = True) -> 
             "roles": sorted(user.roles) if user else [],
             "effective_scopes": sorted(ctx.scopes),
         }
+
+    # ---- multi-device session management ----
+    @app.get("/auth/sessions")
+    async def list_sessions(authorization: str | None = Header(default=None)):
+        ctx = service.authenticate(_bearer(authorization))
+        sessions = [
+            {
+                "session_id": s.session_id,
+                "source": s.source,
+                "created_at": s.created_at,
+                "current": s.current,
+            }
+            for s in service.list_sessions(ctx)
+        ]
+        return {"sessions": sessions}
+
+    @app.post("/auth/sessions/reauthenticate")
+    async def reauthenticate(
+        body: ReauthRequest, authorization: str | None = Header(default=None),
+    ):
+        ctx = service.authenticate(_bearer(authorization))
+        result = service.reauthenticate(ctx, body.code)
+        return {
+            "session_id": result.session_id,
+            "verified_at": result.verified_at,
+            "fresh_until": result.fresh_until,
+        }
+
+    @app.post("/auth/sessions/terminate")
+    async def terminate_session(
+        body: TerminateSessionRequest, authorization: str | None = Header(default=None),
+    ):
+        ctx = service.authenticate(_bearer(authorization))
+        service.terminate_session(ctx, body.session_id)
+        return {"status": "terminated", "session_id": body.session_id}
+
+    @app.post("/auth/sessions/logout-others")
+    async def logout_others(authorization: str | None = Header(default=None)):
+        ctx = service.authenticate(_bearer(authorization))
+        terminated = service.logout_other_sessions(ctx)
+        return {"status": "ok", "terminated": terminated}
 
     @app.post("/admin/rotate-keys")
     async def rotate_keys():

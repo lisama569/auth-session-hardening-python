@@ -9,7 +9,11 @@ from auth.store import Store
 from auth.tokens import KeyRing
 
 
-def build_service(start: float = 1_000_000.0, require_mfa: bool = True):
+def build_service(
+    start: float = 1_000_000.0,
+    require_mfa: bool = True,
+    reauth_freshness: float = 300.0,
+):
     clock = FixedClock(start)
     store = Store(clock=clock)
     keyring = KeyRing(clock=clock)
@@ -17,7 +21,8 @@ def build_service(start: float = 1_000_000.0, require_mfa: bool = True):
     authorizer = Authorizer(store)
     service = SessionService(
         store, keyring, verifier, authorizer, clock=clock,
-        access_ttl=300.0, refresh_ttl=3600.0, require_mfa=require_mfa,
+        access_ttl=300.0, refresh_ttl=3600.0,
+        reauth_freshness=reauth_freshness, require_mfa=require_mfa,
     )
     service.register_user(
         "alice", "pw", roles={"reader"},

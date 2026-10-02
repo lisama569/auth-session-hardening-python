@@ -105,6 +105,10 @@ class TotpVerifier:
             timestamp = self._clock.now()
         return self._hotp(secret, int(timestamp // self._period))
 
+    def step_at(self, timestamp: float) -> int:
+        """Absolute TOTP time-step containing ``timestamp``."""
+        return int(timestamp // self._period)
+
     def _match(self, secret: bytes, code: str, now: float) -> tuple[TotpResult | None, int | None]:
         """Return (result, matched_step). result None means fully invalid."""
         if not (code.isdigit() and len(code) == self._digits):

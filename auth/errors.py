@@ -31,6 +31,13 @@ class ErrorCode(str, Enum):
     TOTP_CLOCK_SKEW = "totp_clock_skew"
     MFA_RATE_LIMITED = "mfa_rate_limited"
     MFA_LOCKED = "mfa_locked"
+    # A one-time TOTP code already consumed for this purpose is replayed;
+    # distinct from totp_invalid / mfa_rate_limited / mfa_locked.
+    TOTP_REPLAY = "totp_replay"
+    # A sensitive op needs a fresh second factor: the last successful MFA
+    # for this session is older than the configured freshness window.
+    # Distinct from credential failures and from MFA throttling/locking.
+    REAUTH_REQUIRED = "reauth_required"
 
     # authorization
     FORBIDDEN = "forbidden"

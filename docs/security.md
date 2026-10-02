@@ -139,15 +139,156 @@ credential_scopes)` 是**唯一**判定函数，HTTP 入口与会话服务
 对应能力（测试 `test_permission_change_takes_effect_for_outstanding_tokens`），
 无需吊销凭据即可止血；凭据吊销（版本/密钥/登出）则作为独立机制存在。
 
-## 4. 本地验证方法
+## 4. 多设备会话管理
+
+### 4.1 会话标识与列举
+
+每次登录完成后创建一个 `SessionRecord`，携带：
+
+- `session_id`：`sess_` 前缀的稳定随机标识，可被用户引用、跨请求不变；
+- `source`：登入来源（登录 start 传入，如 `web` / `mobile` / `cli`）；
+- `created_at`：建立时间（来自可注入时钟）；
+- `token_version`：令牌版本，刷新/下线递增，旧 access 即刻失效。
+
+`GET /auth/sessions` 只列举**当前认证主体自己的、未吊销**的会话，
+并用 `current` 布尔标出本次 access token 所属的那个会话；列举结果
+不会出现任何人的其他会话。
+
+### 4.2 单个下线与「退出其他所有设备」
+
+二者都复用存储层的**原子终止原语**（`Store.terminate_session` /
+`terminate_other_sessions`），在同一把 `RLock` 内一次完成：
+
+1. 会话置 `revoked` 并记录原因（`user_terminated` / `logout_others`）；
+2. `token_version += 1`——此后该会话已签发的全部 access 在
+   `authenticate` 处得到 `access_token_revoked`；
+3. 该会话绑定的**全部** refresh 记录（含旧家族链路与「已 claim、
+   未提交」的在途记录）置 `REVOKED`，刷新入口随即得到
+   `refresh_token_revoked`。
+
+因此下线是**立即**且**访问/刷新双凭据同时**作废；原因可与
+「会话不存在」（`session_not_found`）、「会话已吊销但凭据先撞到家族
+状态」等区分。批量下线时当前会话不在目标集合内，其状态、版本、
+refresh 家族都不被触碰，当前请求与后续刷新照常。
+
+### 4.3 归属判定与存在性隐藏（与统一授权口径一致）
+
+会话管理入口不经过资源 `Authorizer`（它们不是具名资源），但严格
+沿用同一条存在性隐藏原则：`_own_active_session_or_404` 仅当目标
+「存在 **且** 属于当前用户 **且** 未吊销」时才放行，其余三种情况
+（missing / foreign_owner / revoked）抛出**同一个**
+`session_not_found`，HTTP 均为 404、body 完全一致；真实依据只进
+日志。列举接口按主体过滤，越权方连 id 都看不到。这样新增入口不会
+泄露「某个 session_id 是否存在 / 属于谁」。
+
+### 4.4 下线与刷新交错
+
+- 刷新在 claim 之后、提交之前若会话被终止：提交时
+  `replace_refresh` 发现旧记录已非 `ACTIVE/inflight` 而失败，服务层
+  重读记录并归类为 `refresh_token_revoked`（`basis=terminated_in_flight`），
+  不会误发新凭据。
+- 刷新先提交、下线后到：终止原语按 `session_id` 株连全部 refresh，
+  刚轮换出的后继凭据同样立即 `REVOKED`。
+- 同账号其它会话的刷新与凭据在两种交错下都不受影响（并发测试
+  `test_terminate_while_refresh_in_flight_revokes_the_refresh` 等覆盖）。
+
+## 5. 敏感操作再认证（step-up reauthentication）
+
+### 5.1 新鲜度模型
+
+每个会话持久化 `mfa_last_verified_at` 与 `mfa_consumed_steps`：
+
+- **锚点**：登录完成时那次成功的 TOTP 即首个锚点（其时间步同时被
+  标记为已消费）；之后每次成功的 `reauthenticate` 把锚点刷新为当前
+  时刻。
+- **窗口**：敏感操作要求 `now <= mfa_last_verified_at +
+  reauth_freshness`。默认 300 秒，`SessionService(reauth_freshness=...)`
+  可配。
+- **边界**：采用包含边界——恰在 `fresh_until` 放行；严格大于
+  （哪怕一个 epsilon）拒绝为 `reauth_required`，测试在两个边界点
+  各断言一次。
+- **顺延规则**：只有「成功」的再认证会滑动窗口，且起点是本次验证
+  时刻；失败的口令验证、被拒绝的重放都不改锚点。
+
+### 5.2 失败原因三分
+
+敏感操作被拒与再认证本身的失败使用互不重叠的稳定码：
+
+| 情形 | 错误码 | HTTP |
+|------|--------|------|
+| 窗口已过 / 从未验证，需要重做二次验证 | `reauth_required` | 403 |
+| 口令错误 | `totp_invalid` | 400 |
+| 口令仅时钟偏差 | `totp_clock_skew` | 400 |
+| 触发限流 | `mfa_rate_limited` | 429 |
+| 触发锁定 | `mfa_locked` | 409 |
+| 一次性口令重放 | `totp_replay` | 409 |
+
+调用方凭 403 + `reauth_required` 即知「去走一次 reauth 再重试」，
+不会把它与口令错误或限流/锁定混淆。
+
+### 5.3 一次性口令不可重放
+
+TOTP 的口令按 30 秒时间步重复。再认证成功时把命中的**绝对时间步**
+（`now // period + matched_step`）写入会话的已消费集合；登录那一步
+也在集合内。再次提交同一步的口令时：
+
+- 先过 TOTP 校验（保证错误口令仍计失败、限流/锁定照常生效），
+- 再查已消费集合：命中即 `totp_replay`，**不**更新锚点、**不**滑动
+  窗口。
+
+因此同一步口令最多为一个会话授权一次敏感操作；跨会话（不同设备
+各自登录）互不影响，因为消费集合是 per-session 的。
+
+### 5.4 并发一致性
+
+- 再认证的「查重 + 记锚点 + 消费步」与敏感操作的批量终止都在存储
+  层锁内完成：N 个并发、携带同一口令的再认证恰好一个成功，其余
+  全部 `totp_replay`，锚点只更新一次（测试断言
+  `len(consumed_steps)` 与窗口边界）。
+- 多个并发「退出其他设备」在窗口内结论一致：恰有一个看到全部待
+  下线会话、其余看到 0，当前会话永不被终止，计数不错乱。
+
+## 6. 与既有行为的兼容范围
+
+本次为**叠加式**改动，不改变既有登录 / 刷新 / 授权语义：
+
+- 登录、刷新轮换、重用检测、登出、密钥轮换的错误码与状态迁移不变；
+  原 44 个测试全部继续通过。
+- `SessionRecord` 仅新增带默认值的字段（`source`、
+  `mfa_last_verified_at`、`mfa_consumed_steps`）；`create_session`
+  新增带默认值的 `source` 形参，既有调用点无需改动。
+- 新增的两个错误码只出现在新入口（以及空凭据的防御性
+  `unauthenticated`）；既有错误码的 HTTP 映射未改。
+- 既有 `/auth/logout` 与新的会话下线共用吊销原语，但互不替代：
+  logout 仍按 refresh 家族吊销，新下线按「会话 + 其全部家族」吊销。
+- 统一授权 `Authorizer.decide` 未改；新会话入口在其之外实现了等价
+  的存在性隐藏，多个入口（列举 / 单个下线 / 批量下线 / 再认证）对
+  同一归属问题结论一致。
+
+## 7. 本地验证方法
 
 ```bash
 uv sync
-uv run pytest -q          # 41 个测试全部通过
+uv run pytest -q          # 64 个测试全部通过
 uv run pytest -s          # 打印每个关键判定的结构化 JSON 日志
 uv run python scripts/local_demo.py   # 完整链路冒烟脚本
 uv run uvicorn main:app --reload      # 交互式试玩：/docs
 ```
+
+手工复现新能力（时间用 `FixedClock`，脚本里即 `clock.advance(...)`）：
+
+1. 用不同 `source` 登录两次，`GET /auth/sessions` 可见两条会话及
+   `current` 标记；
+2. `POST /auth/sessions/terminate` 点名下线其中一条，随后用它的
+   access 得 409 `access_token_revoked`、refresh 得 409
+   `refresh_token_revoked`，另一条照常；
+3. 用别人的 `session_id` 或一个不存在的 id 调用下线，两次都是
+   404 `session_not_found` 且响应体一致；
+4. `clock.advance(120.001)` 越过新鲜度窗口后调用
+   `logout-others` 得 403 `reauth_required`；恰在边界（advance
+   120.0）仍 200；
+5. 调 `reauthenticate` 提交正确口令后窗口顺延；把同一口令再交一次
+   得 409 `totp_replay`，窗口不滑动。
 
 日志示例（`pytest -s` 可见），展示关键输入与判定依据：
 
