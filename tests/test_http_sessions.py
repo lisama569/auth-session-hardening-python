@@ -15,6 +15,10 @@ def stack():
 
 
 def _http_login(http, service, clock, user="alice", source="web"):
+    # Multiple devices must each spend their own one-time code: advance
+    # one TOTP step before issuing the login code (no-op for the first
+    # login at the shared starting instant only when the clock was not
+    # advanced since the previous login).
     ch = http.post("/auth/login/start",
                    json={"user_id": user, "password": "pw", "source": source})
     assert ch.status_code == 200, ch.text
@@ -22,6 +26,7 @@ def _http_login(http, service, clock, user="alice", source="web"):
     res = http.post("/auth/login/complete",
                     json={"challenge_id": ch.json()["challenge_id"], "code": code})
     assert res.status_code == 200, res.text
+    clock.advance(31.0)  # next login on this user must use a fresh OTP step
     return res.json()
 
 

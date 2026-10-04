@@ -66,8 +66,9 @@ def test_concurrent_reauth_same_code_single_winner_window_once():
 
 
 def test_refresh_committed_then_terminated_kills_successor_too():
-    service, _ = build_service()
+    service, clock = build_service()
     victim = login(service, source="web")
+    clock.advance(31.0)  # second device uses a fresh one-time code
     sibling = login(service, source="mobile")
     victim_ctx = service.authenticate(victim.access_token)
 
@@ -89,6 +90,7 @@ def test_refresh_committed_then_terminated_kills_successor_too():
 def test_terminate_while_refresh_in_flight_revokes_the_refresh():
     service, clock = _barrier_service()
     victim = login(service, source="web")
+    clock.advance(31.0)  # sibling logs in with a fresh one-time code
     sibling = login(service, source="mobile")
     victim_ctx = service.authenticate(victim.access_token)
     sibling_ctx = service.authenticate(sibling.access_token)
@@ -126,9 +128,12 @@ def test_terminate_while_refresh_in_flight_revokes_the_refresh():
 def test_concurrent_logout_others_is_stable():
     # Repeated sensitive ops while fresh must all agree and never corrupt
     # counters or terminate the acting session.
-    service, _ = build_service()
+    service, clock = build_service()
     current = login(service, source="web")
-    others = [login(service, source=f"dev{i}") for i in range(4)]
+    others = []
+    for i in range(4):
+        clock.advance(31.0)  # every device completes login with a fresh OTP
+        others.append(login(service, source=f"dev{i}"))
     ctx = service.authenticate(current.access_token)
 
     counts: list[int] = []

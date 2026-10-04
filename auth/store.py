@@ -15,17 +15,23 @@ from __future__ import annotations
 import secrets
 import threading
 from dataclasses import dataclass
+from enum import Enum
 
 from auth.clock import Clock, SystemClock
-
-
-from enum import Enum
 
 
 class RefreshState(str, Enum):
     ACTIVE = "active"
     ROTATED = "rotated"   # successfully used to mint a successor
     REVOKED = "revoked"   # logout, reuse-detection or admin revoke
+
+
+class MfaConsumeResult(str, Enum):
+    """Outcome of the atomic one-time-code consume move."""
+
+    OK = "ok"
+    REPLAY = "totp_replay"
+    SESSION_GONE = "session_gone"
 
 
 @dataclass
@@ -86,6 +92,10 @@ class Store:
         self._users: dict[str, UserRecord] = {}
         self._sessions: dict[str, SessionRecord] = {}
         self._refreshes: dict[str, RefreshRecord] = {}
+        # Authoritative one-time-code consumption ledger, keyed by
+        # *user* (not session): a TOTP step consumed in one login session
+        # can never authorize anything again in another.
+        self._mfa_consumed: dict[str, tuple[int, ...]] = {}
 
     # ---- users ----
     def upsert_user(self, user: UserRecord) -> None:
@@ -107,6 +117,16 @@ class Store:
             )
             self._sessions[record.session_id] = record
             return record
+
+    def delete_session(self, session_id: str) -> None:
+        """Remove a freshly created session that never reached completion.
+
+        Used to roll back login when its one-time code turns out to be a
+        replay; an unauthenticated client must not be left holding a
+        session even though the code was refused.
+        """
+        with self._lock:
+            self._sessions.pop(session_id, None)
 
     def get_session(self, session_id: str) -> SessionRecord | None:
         with self._lock:
@@ -203,21 +223,76 @@ class Store:
 
     # ---- per-session MFA freshness (step-up reauthentication) ----
     def get_mfa_state(self, session_id: str) -> tuple[float | None, frozenset[int]] | None:
-        """Return ``(last_verified_at, consumed_totp_steps)`` or ``None``."""
+        """Return ``(last_verified_at, consumed_totp_steps)`` or ``None``.
+
+        The consumed-steps view is the union of the authoritative
+        per-user ledger for the session's owner and the session's own
+        mirror; freshness anchors remain strictly per-session.
+        """
         with self._lock:
             record = self._sessions.get(session_id)
             if record is None:
                 return None
-            return record.mfa_last_verified_at, frozenset(record.mfa_consumed_steps)
+            user_steps = frozenset(self._mfa_consumed.get(record.user_id, ()))
+            session_steps = frozenset(record.mfa_consumed_steps)
+            return record.mfa_last_verified_at, user_steps | session_steps
+
+    def get_consumed_mfa_steps(self, user_id: str) -> frozenset[int]:
+        """Snapshot of the user-wide one-time-code consumption ledger."""
+        with self._lock:
+            return frozenset(self._mfa_consumed.get(user_id, ()))
+
+    @staticmethod
+    def _append_step(history: tuple[int, ...], step: int) -> tuple[int, ...]:
+        # Keep replay history bounded: a TOTP code older than the
+        # verifier's skew window fails as totp_invalid anyway, so only the
+        # recent steps can ever match as a replay.
+        if step in history:
+            return history
+        return (*history[-(MFA_STEPS_RETAINED - 1):], step)
+
+    def consume_mfa_step(
+        self, user_id: str, session_id: str, at: float, consumed_step: int,
+    ) -> MfaConsumeResult:
+        """Atomically consume a one-time-code step and slide the window.
+
+        The replay check, the user-wide ledger append, the per-session
+        mirror append and the freshness-anchor write happen in a single
+        critical section, so:
+
+        * concurrent presentations of one code have exactly one winner;
+          losers get ``REPLAY`` and neither the window nor the ledgers
+          move;
+        * a step already consumed in *any* of the user's sessions (login
+          or step-up) is refused here too — no cross-session reuse;
+        * freshness slides exactly once per consumed code.
+
+        ``SESSION_GONE`` means the target session is missing/revoked; in
+        that case nothing is consumed (a reauth on a dead session must
+        not burn a code in another session).
+        """
+        with self._lock:
+            record = self._sessions.get(session_id)
+            if record is None or record.revoked:
+                return MfaConsumeResult.SESSION_GONE
+            user_history = self._mfa_consumed.get(user_id, ())
+            if consumed_step in user_history or consumed_step in record.mfa_consumed_steps:
+                return MfaConsumeResult.REPLAY
+            self._mfa_consumed[user_id] = self._append_step(user_history, consumed_step)
+            record.mfa_consumed_steps = self._append_step(
+                record.mfa_consumed_steps, consumed_step,
+            )
+            record.mfa_last_verified_at = at
+            return MfaConsumeResult.OK
 
     def mark_mfa_verified(
         self, session_id: str, at: float, consumed_step: int,
     ) -> bool:
-        """Record a successful second factor and consume its TOTP step.
+        """Legacy direct marker (test/admin helpers).
 
-        Refuses to touch a missing/revoked session. Consuming the same
-        step twice is a no-op at the store layer; the service rejects
-        replays *before* calling this.
+        Refuses a missing/revoked session. A step already in the owner's
+        ledger is a no-op that still refreshes the session anchor; the
+        service performs replay rejection *before* reaching here.
         """
         with self._lock:
             record = self._sessions.get(session_id)
@@ -225,12 +300,11 @@ class Store:
                 return False
             record.mfa_last_verified_at = at
             if consumed_step not in record.mfa_consumed_steps:
-                # Keep replay history bounded: a TOTP code older than the
-                # verifier's skew window fails as totp_invalid anyway, so
-                # only the recent steps can ever match as a replay.
-                record.mfa_consumed_steps = (
-                    *record.mfa_consumed_steps[-(MFA_STEPS_RETAINED - 1):],
-                    consumed_step,
+                record.mfa_consumed_steps = self._append_step(
+                    record.mfa_consumed_steps, consumed_step,
+                )
+                self._mfa_consumed[record.user_id] = self._append_step(
+                    self._mfa_consumed.get(record.user_id, ()), consumed_step,
                 )
             return True
 

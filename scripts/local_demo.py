@@ -20,6 +20,8 @@ def show(title: str, response) -> None:
 
 
 def _login(http, base, clock, user="alice", source="web"):
+    # One one-time code can complete at most one login per user, so a
+    # second device presents the next TOTP step.
     ch = http.post(
         "/auth/login/start",
         json={"user_id": user, "password": "pw", "source": source},
@@ -31,6 +33,7 @@ def _login(http, base, clock, user="alice", source="web"):
         json={"challenge_id": ch.json()["challenge_id"], "code": code},
     )
     show(f"login/complete ({user}/{source})", done)
+    clock.advance(31.0)
     return done.json()
 
 
@@ -72,9 +75,10 @@ def main() -> None:
          http.post("/auth/sessions/terminate", headers=auth,
                    json={"session_id": "sess_ghost"}))
 
-    # sensitive op needs a fresh second factor
-    show("logout-others while fresh",
-         http.post("/auth/sessions/logout-others", headers=auth))
+    # sensitive op needs a fresh second factor; the cli sibling is kept
+    # alive until the cross-session replay demo below, so the boundary
+    # demonstration uses a read-only freshness probe instead of a sweep.
+    lap_auth = {"Authorization": f"Bearer {lap['access_token']}"}
     clock.advance(120.001)
     show("logout-others after window (403 reauth_required)",
          http.post("/auth/sessions/logout-others", headers=auth))
@@ -83,7 +87,11 @@ def main() -> None:
          http.post("/auth/sessions/reauthenticate", headers=auth, json={"code": code}))
     show("replay same code (409 totp_replay)",
          http.post("/auth/sessions/reauthenticate", headers=auth, json={"code": code}))
-    show("logout-others after reauth",
+    # the same one-time code cannot be replayed from another session either
+    show("cross-session replay from cli session (409 totp_replay)",
+         http.post("/auth/sessions/reauthenticate", headers=lap_auth, json={"code": code}))
+    # now the sweep terminates the still-alive cli sibling
+    show("logout-others after reauth (terminates cli)",
          http.post("/auth/sessions/logout-others", headers=auth))
 
     # replay the pre-rotation refresh: conservative family+session burn

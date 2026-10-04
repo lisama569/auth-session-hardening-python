@@ -196,7 +196,9 @@ refresh 家族都不被触碰，当前请求与后续刷新照常。
 
 ### 5.1 新鲜度模型
 
-每个会话持久化 `mfa_last_verified_at` 与 `mfa_consumed_steps`：
+每个会话持久化自己的 `mfa_last_verified_at`（新鲜度锚点**仍按会话**
+独立），而一次性口令的已消费记录保存在**按用户**的台账
+`_mfa_consumed[user_id]` 中、会话上保留一份镜像（`mfa_consumed_steps`）：
 
 - **锚点**：登录完成时那次成功的 TOTP 即首个锚点（其时间步同时被
   标记为已消费）；之后每次成功的 `reauthenticate` 把锚点刷新为当前
@@ -226,39 +228,66 @@ refresh 家族都不被触碰，当前请求与后续刷新照常。
 调用方凭 403 + `reauth_required` 即知「去走一次 reauth 再重试」，
 不会把它与口令错误或限流/锁定混淆。
 
-### 5.3 一次性口令不可重放
+### 5.3 一次性口令不可重放（含并发与跨会话）
 
-TOTP 的口令按 30 秒时间步重复。再认证成功时把命中的**绝对时间步**
-（`now // period + matched_step`）写入会话的已消费集合；登录那一步
-也在集合内。再次提交同一步的口令时：
+TOTP 的口令按 30 秒时间步重复。再认证 / 登录成功时把命中的**绝对时间步**
+（`now // period + matched_step`）写入**按用户**的已消费台账
+（`Store._mfa_consumed[user_id]`），并在所属会话上保留同一步的镜像。
+登录那一步同样进用户台账。再次提交同一步口令时：
 
 - 先过 TOTP 校验（保证错误口令仍计失败、限流/锁定照常生效），
-- 再查已消费集合：命中即 `totp_replay`，**不**更新锚点、**不**滑动
-  窗口。
+- 再由**原子**原语 `Store.consume_mfa_step(user_id, session_id, at, step)`
+  在存储层同一把 `RLock` 内一次完成「查重 → 追加用户台账 → 追加会话镜像
+  → 写新鲜度锚点」：命中已消费步即 `totp_replay`，**不**更新锚点、
+  **不**滑动窗口、台账也不增加任何记录。
 
-因此同一步口令最多为一个会话授权一次敏感操作；跨会话（不同设备
-各自登录）互不影响，因为消费集合是 per-session 的。
+因此同一步口令在**同一用户下、跨所有会话**最多只能授权一次：
+
+| 重放形态 | 结果 |
+|----------|------|
+| 同一步在同一会话里再次提交 | `totp_replay`（409） |
+| 同一时刻 N 个请求提交同一口令（同会话或跨会话） | 恰好 1 个成功，其余全部 `totp_replay`（409） |
+| 一个会话用掉后，换到该用户的另一个会话再用 | `totp_replay`（409） |
+| 另一个会话登录时直接复用已用过的口令完成登录 | `totp_replay`（409），新建会话随即撤回，不留任何已登录会话 |
+
+不同用户的相同绝对时间步互不影响（台账按 `user_id` 隔离）。`totp_replay`
+与 `totp_invalid`（口令本身错误）、`mfa_rate_limited` / `mfa_locked`
+（限流或锁定）使用互不重叠的错误码，调用方可明确区分。
 
 ### 5.4 并发一致性
 
-- 再认证的「查重 + 记锚点 + 消费步」与敏感操作的批量终止都在存储
-  层锁内完成：N 个并发、携带同一口令的再认证恰好一个成功，其余
-  全部 `totp_replay`，锚点只更新一次（测试断言
-  `len(consumed_steps)` 与窗口边界）。
+- 再认证的「查重 + 记锚点 + 消费步」是存储层锁内的**单个**原子动作：
+  N 个并发、携带同一口令的再认证恰好一个成功，其余全部 `totp_replay`，
+  锚点只更新一次、用户台账中该步只出现一次（不是靠线程调度碰运气，也不
+  靠 sleep）。被拒绝的路径不写任何状态，因此不会出现窗口顺延两次、次数
+  对不上或本该拦截的请求被放行。
+- 登录完成与再认证共用同一个原子消费原语；若登录在查重环节落败
+  （并发重复登录或口令已在其它会话消费），刚创建的会话会被
+  `delete_session` 撤回，拒绝不会留下一条已认证会话。
 - 多个并发「退出其他设备」在窗口内结论一致：恰有一个看到全部待
   下线会话、其余看到 0，当前会话永不被终止，计数不错乱。
+- 新鲜度窗口的边界口径不变：恰在 `fresh_until` 放行，严格大于（哪怕
+  一个 epsilon）拒绝为 `reauth_required`；再认证的窗口从本次验证时刻
+  起算，失败的口令验证与被拒绝的重放都不改锚点。
 
 ## 6. 与既有行为的兼容范围
 
 本次为**叠加式**改动，不改变既有登录 / 刷新 / 授权语义：
 
 - 登录、刷新轮换、重用检测、登出、密钥轮换的错误码与状态迁移不变；
-  原 44 个测试全部继续通过。
-- `SessionRecord` 仅新增带默认值的字段（`source`、
-  `mfa_last_verified_at`、`mfa_consumed_steps`）；`create_session`
-  新增带默认值的 `source` 形参，既有调用点无需改动。
-- 新增的两个错误码只出现在新入口（以及空凭据的防御性
-  `unauthenticated`）；既有错误码的 HTTP 映射未改。
+  原有登录 / 刷新 / 授权 / 多设备 / 再认证用例全部继续通过。
+- 唯一收紧的语义是一次性口令的消费范围由「按会话」改为「按用户」：
+  同一用户的第二个设备完成登录时必须使用**新一步**口令（真实环境下
+  30 秒后自然换步）；此前测试夹具在 `FixedClock` 同一时刻为多设备
+  登录复用同一口令的写法，改为每次登录前 `clock.advance(31.0)`，
+  与生产使用方式一致。
+- `SessionRecord` 字段保持不变（`mfa_consumed_steps` 现为用户台账
+  的会话镜像）；`Store` 新增 `consume_mfa_step`（原子查重+消费+
+  顺延）、`get_consumed_mfa_steps`、`delete_session` 与
+  `MfaConsumeResult`，既有 `get_mfa_state` / `mark_mfa_verified`
+  保留，`create_session` 签名不变。
+- 错误码与 HTTP 映射未改：重放继续是 409 `totp_replay`，窗口过期
+  继续是 403 `reauth_required`，错误口令继续是 400 `totp_invalid`。
 - 既有 `/auth/logout` 与新的会话下线共用吊销原语，但互不替代：
   logout 仍按 refresh 家族吊销，新下线按「会话 + 其全部家族」吊销。
 - 统一授权 `Authorizer.decide` 未改；新会话入口在其之外实现了等价
@@ -269,11 +298,46 @@ TOTP 的口令按 30 秒时间步重复。再认证成功时把命中的**绝对
 
 ```bash
 uv sync
-uv run pytest -q          # 64 个测试全部通过
+uv run pytest -q          # 全部测试通过（含一次性口令并发/跨会话回归）
 uv run pytest -s          # 打印每个关键判定的结构化 JSON 日志
+uv run pytest tests/test_totp_replay.py -v   # 只跑两类回归，逐条看用例名与结果
 uv run python scripts/local_demo.py   # 完整链路冒烟脚本
 uv run uvicorn main:app --reload      # 交互式试玩：/docs
 ```
+
+### 7.1 一次性口令并发 / 跨会话回归如何稳定复现
+
+回归用例在 `tests/test_totp_replay.py`，**不靠多线程自然竞争**：
+
+- **同时提交同一个口令**：`ReauthBarrierService` 通过服务钩子
+  `_mfa_step_consuming` 放置 `threading.Barrier`，让 N 路请求确定性地
+  同时停在「TOTP 已校验通过、原子消费尚未执行」的点上，再一起放行。
+  - `test_simultaneous_same_code_same_session_single_winner[2|8]`：
+    同一会话 2 路 / 8 路同时提交同一口令，断言恰好 1 个成功、其余
+    全部 `totp_replay`，且窗口只顺延一次、台账中该步只出现一次；
+  - `test_simultaneous_same_code_across_two_sessions_single_winner`：
+    两个登录会话同时提交同一口令，同样恰好 1 个成功。
+- **跨会话重复使用**：
+  - `test_cross_session_replay_is_rejected`：口令在会话 A 用掉后，
+    换到同用户会话 B（口令仍在 ±1 步容忍窗口内，密码学上有效）必须
+    得到 `totp_replay`，且会话 B 的锚点没有被滑动；
+  - `test_second_login_replaying_a_spent_code_is_rejected_and_leaves_no_session`：
+    另一个设备直接拿已用过的口令完成登录，得到 `totp_replay`，且不
+    残留新会话；
+  - `test_login_replay_is_distinct_from_wrong_code`：同一界面下错误
+    口令仍是 `totp_invalid`，与重放原因可区分。
+- **边界口径回归**：`test_freshness_bound_unchanged_after_ledger_change`
+  断言恰在 `fresh_until` 放行、过一个 epsilon 拒绝为 `reauth_required`，
+  改造前后口径一致。
+- 存储层原子性另有 `tests/test_store.py` 中的
+  `test_consume_mfa_step_is_single_winner_under_contention`（8 线程
+  同起点压测原语）与
+  `test_consume_mfa_step_is_user_scoped_across_sessions`（跨会话/跨
+  用户/已吊销会话的台账语义）直接压测。
+
+这些用例在修复前的实现上可稳定复现失败（同会话并发两路都成功、
+跨会话重复使用被放行）；用历史代码建 worktree 拷贝该测试文件即可
+对照。并发用例不使用 `sleep`，整套 75 个测试可反复稳定通过。
 
 手工复现新能力（时间用 `FixedClock`，脚本里即 `clock.advance(...)`）：
 
@@ -288,7 +352,9 @@ uv run uvicorn main:app --reload      # 交互式试玩：/docs
    `logout-others` 得 403 `reauth_required`；恰在边界（advance
    120.0）仍 200；
 5. 调 `reauthenticate` 提交正确口令后窗口顺延；把同一口令再交一次
-   得 409 `totp_replay`，窗口不滑动。
+   得 409 `totp_replay`，窗口不滑动；用同一用户的另一个登录会话
+   （登录前先 `clock.advance(31.0)` 取新口令登录）再交这个旧口令，
+   同样是 409 `totp_replay`。
 
 日志示例（`pytest -s` 可见），展示关键输入与判定依据：
 

@@ -21,32 +21,39 @@ def _ctx(service, tokens):
 
 
 def _second_login(service, user="alice", source="mobile"):
+    # A second device presents a *fresh* one-time code: one OTP can only
+    # ever complete one login (per-user consumption ledger).
+    service._clock.advance(31.0)
     return login(service, user=user, source=source)
 
 
 def test_list_sessions_shows_metadata_and_marks_current():
     service, clock = build_service()
+    web_login_at = clock.now()
     web = login(service, source="web")
     mobile = _second_login(service, source="mobile")
+    mobile_login_at = clock.now()
 
     web_ctx = _ctx(service, web)
+    mob_ctx = _ctx(service, mobile)
     infos = service.list_sessions(web_ctx)
     by_id = {s.session_id: s for s in infos}
 
-    assert set(by_id) == {web_ctx.session_id, _ctx(service, mobile).session_id}
+    assert set(by_id) == {web_ctx.session_id, mob_ctx.session_id}
     assert by_id[web_ctx.session_id].current is True
     assert by_id[web_ctx.session_id].source == "web"
-    assert by_id[_ctx(service, mobile).session_id].current is False
-    assert by_id[_ctx(service, mobile).session_id].source == "mobile"
+    assert by_id[mob_ctx.session_id].current is False
+    assert by_id[mob_ctx.session_id].source == "mobile"
     # ids are stable references across calls
     again = {s.session_id for s in service.list_sessions(web_ctx)}
     assert again == set(by_id)
-    # created_at is the login instant
-    assert all(s.created_at == clock.now() for s in infos)
+    # created_at is the login instant of each session
+    assert by_id[web_ctx.session_id].created_at == web_login_at
+    assert by_id[mob_ctx.session_id].created_at == mobile_login_at
 
     # Viewed from the mobile session, the current marker flips.
-    mob_infos = {s.session_id: s for s in service.list_sessions(_ctx(service, mobile))}
-    assert mob_infos[_ctx(service, mobile).session_id].current is True
+    mob_infos = {s.session_id: s for s in service.list_sessions(mob_ctx)}
+    assert mob_infos[mob_ctx.session_id].current is True
     assert mob_infos[web_ctx.session_id].current is False
 
 
@@ -120,7 +127,7 @@ def test_logout_others_revokes_all_but_current():
     service, _ = build_service()
     current = login(service, source="web")
     other_a = _second_login(service, source="mobile")
-    other_b = login(service, source="cli")
+    other_b = _second_login(service, source="cli")
     ctx = _ctx(service, current)
 
     count = service.logout_other_sessions(ctx)

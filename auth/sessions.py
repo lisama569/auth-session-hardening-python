@@ -29,7 +29,14 @@ from auth.clock import Clock, SystemClock
 from auth.errors import AuthError, ErrorCode
 from auth.logging_utils import log_decision
 from auth.mfa import TotpResult, TotpVerifier
-from auth.store import RefreshRecord, RefreshState, SessionRecord, Store, UserRecord
+from auth.store import (
+    MfaConsumeResult,
+    RefreshRecord,
+    RefreshState,
+    SessionRecord,
+    Store,
+    UserRecord,
+)
 from auth.tokens import KeyRing, TokenClaims, b64url_decode
 
 ACCESS_TTL_SECONDS = 300.0                    # 5 minutes
@@ -224,11 +231,29 @@ class SessionService:
             self._challenges.pop(challenge_id, None)
         session = self.store.create_session(user.user_id, challenge.source)
         # The login second factor is the first freshness anchor and its
-        # one-time code is consumed for the new session (cannot later be
-        # replayed as a step-up reauthentication).
+        # one-time code is consumed against the *user-wide* ledger: it
+        # can neither be replayed as a step-up here nor reused to log in
+        # / reauthenticate another session.
         now = self._clock.now()
         consumed_step = self.verifier.step_at(now) + (status.matched_step or 0)
-        self.store.mark_mfa_verified(session.session_id, now, consumed_step)
+        self._mfa_step_consuming(user.user_id, session.session_id, consumed_step)
+        outcome = self.store.consume_mfa_step(
+            user.user_id, session.session_id, now, consumed_step,
+        )
+        if outcome is MfaConsumeResult.REPLAY:
+            # The code was already spent (concurrent/duplicate login or a
+            # prior session): withdraw the session we just created so no
+            # authenticated session lingers from the refused attempt.
+            self.store.delete_session(session.session_id)
+            log_decision(
+                "login.complete", "totp_replay", user=user.user_id,
+                source=challenge.source, step=consumed_step,
+                session=session.session_id,
+            )
+            raise AuthError(code=ErrorCode.TOTP_REPLAY)
+        if outcome is MfaConsumeResult.SESSION_GONE:  # defensive: brand-new row
+            self.store.delete_session(session.session_id)
+            raise AuthError(code=ErrorCode.SESSION_NOT_FOUND)
         tokens = self._issue(session)
         log_decision(
             "login.complete", "ok", user=user.user_id, source=challenge.source,
@@ -242,6 +267,14 @@ class SessionService:
 
         Default no-op; tests override it to create deterministic
         concurrency windows (without sleeping or mocking crypto).
+        """
+
+    def _mfa_step_consuming(self, user_id: str, session_id: str, step: int) -> None:
+        """Hook invoked immediately before the atomic code-consume move.
+
+        Default no-op; tests override it with a barrier so concurrent
+        reauthentications carrying the same one-time code rendezvous
+        deterministically just outside the atomic store section.
         """
 
     def refresh(self, refresh_token: str) -> IssuedTokens:
@@ -485,11 +518,17 @@ class SessionService:
         Rules:
         * the same TOTP/MFA gating as login applies (wrong code, clock
           skew, rate limit, lock all remain distinguishable);
-        * a one-time code already consumed for this session (at login or
-          a prior step-up) is rejected as ``totp_replay`` — it can never
-          authorize a second sensitive operation;
+        * a one-time code already consumed for *this user* — at login, at
+          a prior step-up in this session, or in any of the user's other
+          sessions — is rejected as ``totp_replay``: one code authorizes
+          at most one sensitive operation across all sessions;
         * on success the freshness window slides forward to
         ``now + reauth_freshness`` from the new verification instant.
+
+        The replay check, window slide and ledger append are one atomic
+        store move (:meth:`Store.consume_mfa_step`), so concurrent calls
+        presenting the same code have exactly one winner; losers get
+        ``totp_replay`` and the window does not move.
         """
         session = self._require_session(ctx)
         user = self.store.get_user(ctx.user_id)
@@ -509,18 +548,23 @@ class SessionService:
         now = self._clock.now()
         matched_step = self.verifier.step_at(now) + (status.matched_step or 0)
 
-        # Consume-check and freshness update are one atomic store move,
-        # so concurrent reauth with the same one-time code has exactly
-        # one winner and cannot slide the window twice.
-        prior = self.store.get_mfa_state(session.session_id)
-        if prior is not None and matched_step in prior[1]:
+        # Replay check, freshness slide and ledger append are one atomic
+        # store move: concurrent reauth with the same one-time code has
+        # exactly one winner and the window slides exactly once; a step
+        # spent in another of the user's sessions is rejected too.
+        self._mfa_step_consuming(user.user_id, session.session_id, matched_step)
+        outcome = self.store.consume_mfa_step(
+            user.user_id, session.session_id, now, matched_step,
+        )
+        if outcome is MfaConsumeResult.REPLAY:
+            prior = self.store.get_consumed_mfa_steps(user.user_id)
             log_decision(
                 "session.reauth", "totp_replay", user=user.user_id,
                 session=session.session_id, step=matched_step,
-                consumed_steps=sorted(prior[1]),
+                consumed_steps=sorted(prior),
             )
             raise AuthError(code=ErrorCode.TOTP_REPLAY)
-        if not self.store.mark_mfa_verified(session.session_id, now, matched_step):
+        if outcome is MfaConsumeResult.SESSION_GONE:
             # Session vanished/revoked between auth and reauth.
             raise AuthError(code=ErrorCode.SESSION_NOT_FOUND)
 
