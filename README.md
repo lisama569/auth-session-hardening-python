@@ -31,7 +31,8 @@ conftest.py         # 测试引导：开启结构化判定日志
 ```bash
 uv sync
 uv run uvicorn main:app --reload          # http://127.0.0.1:8000/docs
-uv run pytest -q                          # 全部测试（64 个）
+uv run pytest -q                          # 全部测试（75 个），结尾按业务汇总
+uv run pytest -v                          # 列出每个业务的每条用例与结果
 uv run pytest -s                          # 同时打印关键输入与判定依据日志
 uv run python scripts/local_demo.py       # 一条脚本走完整条安全链路
 ```
@@ -115,12 +116,17 @@ TOTP 密钥在进程启动时随机生成；脚本 `scripts/local_demo.py` 会�
   `now > fresh_until`（哪怕只多一微秒）拒绝为 `reauth_required`（403），
   调用方据此知道需要重新做一次二次验证——它与 `totp_invalid`（400）、
   `mfa_rate_limited`（429）、`mfa_locked`（409）都不同。
-- **一次性口令不可重放**：每个会话记录已消费的 TOTP 绝对时间步（登录
-  那一步也算）。同一口令第二次用于再认证直接报 `totp_replay`（409），
-  即使它在密码学上仍有效、即使窗口开着；被拒重放**不顺延窗口**。
-- 再认证与新鲜度判定走存储层同一把锁，并发下同一口令只有一个赢家、
-  窗口只顺延一次；下线与刷新交错时，刷新若在提交阶段发现家族已被
-  终止，得到可区分的 `refresh_token_revoked`。
+- **一次性口令不可重放（按用户、跨会话）**：每个用户维护一份已消费
+  TOTP 绝对时间步总账（登录那一步也入账）。同一口令**无论是在同一会话
+  内再次提交、换到另一个会话/设备、还是被多个请求同时提交**，都只有一次
+  能授权成功，其余直接报 `totp_replay`（409）；即使它在密码学上仍有效、
+  即使新鲜度窗口开着；被拒重放**不顺延窗口、不写任何消费记录**。该原因
+  与 `totp_invalid`（400，口令本身错误）、`mfa_rate_limited`（429）/
+  `mfa_locked`（409）明确区分。
+- 再认证的「重放判定 + 消费 + 窗口顺延」是存储层同一把锁内的**单一原子
+  操作**：并发下同一口令恰好一个赢家、窗口只顺延一次、消费只记一次；
+  不靠线程调度碰运气，也不靠「缓一下再判断」。下线与刷新交错时，刷新若
+  在提交阶段发现家族已被终止，得到可区分的 `refresh_token_revoked`。
 
 ## 测试覆盖
 
@@ -131,6 +137,7 @@ TOTP 密钥在进程启动时随机生成；脚本 `scripts/local_demo.py` 会�
 - `tests/test_http_api.py`：跨入口授权一致性与全部错误码的 HTTP 形态
 - `tests/test_device_sessions.py`：会话列举（稳定 id / 来源 / 时间 / 当前标记）、单个与批量下线后 access+refresh 立即作废、越权与不存在同形、未点名会话不受影响
 - `tests/test_reauth.py`：新鲜度窗口**包含/超出边界**、再认证顺延、失败原因可区分（错误口令/限流）、**一次性口令不可重放**、登录口令已消费
-- `tests/test_concurrent_sessions.py`：同一口令并发再认证单赢家且窗口只顺延一次、下线与刷新在 claim 窗口内交错、refresh 已提交后下线株连后继凭据、并发批量下线计数稳定
-- `tests/test_http_sessions.py`：新端点的 HTTP 形态（404 同形、403 引导再认证、409 重放、401 未认证）
-- `tests/test_store.py` / `tests/test_tokens.py`：原子 claim/轮换、签名/篡改/过期/密钥轮换
+- `tests/test_concurrent_reauth_replay.py`：**确定性**复现「同一口令被同时提交」（线程门闩：所有请求先在「口令已校验、未消费」处会合，再一起进入消费判定，不靠自然竞争）与「跨会话重复使用」；断言恰好 1 个成功、其余 `totp_replay`、窗口只顺延一次、消费只记一次、输家锚点不动；并覆盖按用户隔离与下一时间步新口令仍可用
+- `tests/test_concurrent_sessions.py`：同一口令并发再认证单赢家且窗口只顺延一次（确定性门闩）、下线与刷新在 claim 窗口内交错、refresh 已提交后下线株连后继凭据、并发批量下线计数稳定
+- `tests/test_http_sessions.py`：新端点的 HTTP 形态（404 同形、403 引导再认证、409 同会话/跨会话重放、401 未认证）
+- `tests/test_store.py` / `tests/test_tokens.py`：原子 claim/轮换、**一次性口令跨会话消费的原子性与并发单赢家**、签名/篡改/过期/密钥轮换

@@ -73,10 +73,18 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}_{secrets.token_urlsafe(12)}"
 
 
-# Replay history depth per session: comfortably beyond the TOTP verifier's
-# max skew window (3 steps each side) so replay detection never forgets a
-# step that could still cryptographically validate.
+# Replay history depth: comfortably beyond the TOTP verifier's max skew
+# window (3 steps each side) so replay detection never forgets a step
+# that could still cryptographically validate.
 MFA_STEPS_RETAINED = 8
+
+
+class MfaConsumeResult(str, Enum):
+    """Outcome of an atomic TOTP step consumption attempt."""
+
+    OK = "ok"
+    SESSION_GONE = "session_gone"
+    STEP_REPLAYED = "step_replayed"
 
 
 class Store:
@@ -86,6 +94,11 @@ class Store:
         self._users: dict[str, UserRecord] = {}
         self._sessions: dict[str, SessionRecord] = {}
         self._refreshes: dict[str, RefreshRecord] = {}
+        # Per-user, cross-session ledger of absolute TOTP steps already
+        # consumed (by login or step-up). This is the authoritative
+        # one-time-use record: a code consumed in one session of the user
+        # can never authorize a sensitive operation from another.
+        self._user_mfa_steps: dict[str, tuple[int, ...]] = {}
 
     # ---- users ----
     def upsert_user(self, user: UserRecord) -> None:
@@ -201,23 +214,89 @@ class Store:
                             refresh.used_at = now
             return len(targets)
 
-    # ---- per-session MFA freshness (step-up reauthentication) ----
+    # ---- MFA freshness (step-up reauthentication) ----
     def get_mfa_state(self, session_id: str) -> tuple[float | None, frozenset[int]] | None:
-        """Return ``(last_verified_at, consumed_totp_steps)`` or ``None``."""
+        """Return ``(last_verified_at, consumed_totp_steps)`` or ``None``.
+
+        The returned steps are the per-session view (a subset of the
+        user's cross-session ledger).
+        """
         with self._lock:
             record = self._sessions.get(session_id)
             if record is None:
                 return None
             return record.mfa_last_verified_at, frozenset(record.mfa_consumed_steps)
 
+    def get_consumed_steps(self, user_id: str) -> frozenset[int]:
+        """Snapshot of the user's cross-session consumed TOTP steps."""
+        with self._lock:
+            return frozenset(self._user_mfa_steps.get(user_id, ()))
+
+    @staticmethod
+    def _append_bounded(steps: tuple[int, ...], step: int) -> tuple[int, ...]:
+        """Append *step*, keeping at most ``MFA_STEPS_RETAINED`` entries."""
+        if step in steps:
+            return steps
+        return (*steps[-(MFA_STEPS_RETAINED - 1):], step)
+
+    def record_mfa_login(
+        self, session_id: str, user_id: str, at: float, consumed_step: int,
+    ) -> bool:
+        """Record a login second factor: anchor the session and register
+        the one-time code's step in the user's cross-session ledger.
+
+        Login remains idempotent across devices (two logins presenting
+        the same code both succeed): the step is recorded once, but a
+        login never rejects on replay. Refuses a missing/revoked session.
+        """
+        with self._lock:
+            record = self._sessions.get(session_id)
+            if record is None or record.revoked:
+                return False
+            record.mfa_last_verified_at = at
+            record.mfa_consumed_steps = self._append_bounded(
+                record.mfa_consumed_steps, consumed_step)
+            self._user_mfa_steps[user_id] = self._append_bounded(
+                self._user_mfa_steps.get(user_id, ()), consumed_step)
+            return True
+
+    def consume_mfa_step(
+        self, session_id: str, user_id: str, at: float, consumed_step: int,
+    ) -> MfaConsumeResult:
+        """Atomically replay-check a TOTP step, consume it and slide the
+        freshness window — all under one lock acquisition.
+
+        The replay ledger is per **user**, so the step is rejected no
+        matter which of the user's sessions (or which concurrent request)
+        already consumed it. Either every state change happens or none:
+
+        * ``STEP_REPLAYED`` -> nothing is written (the window does not
+          slide, no ledger/session entry is added);
+        * ``SESSION_GONE``   -> missing/revoked session, nothing written;
+        * ``OK``             -> user ledger + session history gain the
+          step once, and this session's anchor moves to ``at`` once.
+        """
+        with self._lock:
+            record = self._sessions.get(session_id)
+            if record is None or record.revoked:
+                return MfaConsumeResult.SESSION_GONE
+            if consumed_step in self._user_mfa_steps.get(user_id, ()):
+                return MfaConsumeResult.STEP_REPLAYED
+            record.mfa_last_verified_at = at
+            record.mfa_consumed_steps = self._append_bounded(
+                record.mfa_consumed_steps, consumed_step)
+            self._user_mfa_steps[user_id] = self._append_bounded(
+                self._user_mfa_steps.get(user_id, ()), consumed_step)
+            return MfaConsumeResult.OK
+
     def mark_mfa_verified(
         self, session_id: str, at: float, consumed_step: int,
     ) -> bool:
-        """Record a successful second factor and consume its TOTP step.
+        """Record a successful second factor for a session.
 
-        Refuses to touch a missing/revoked session. Consuming the same
-        step twice is a no-op at the store layer; the service rejects
-        replays *before* calling this.
+        Kept for compatibility/administration; prefer the atomic
+        :meth:`consume_mfa_step` on the reauthentication path, which also
+        enforces cross-session one-time use.
         """
         with self._lock:
             record = self._sessions.get(session_id)

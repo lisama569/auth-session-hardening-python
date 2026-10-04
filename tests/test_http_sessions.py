@@ -127,6 +127,34 @@ def test_replay_of_one_time_code_is_409(stack):
     assert r.json()["error"] == "totp_replay"
 
 
+def test_cross_session_replay_of_one_time_code_is_409(stack):
+    # Same one-time code consumed by a step-up on device A is presented on
+    # device B (another session of the same user): 409 totp_replay — not a
+    # successful step-up, and distinguishable from a wrong code (400) and
+    # rate limiting (429).
+    http, service, clock = stack
+    web = _http_login(http, service, clock, source="web")
+    mob = _http_login(http, service, clock, source="mobile")
+    h_web = {"Authorization": f"Bearer {web['access_token']}"}
+    h_mob = {"Authorization": f"Bearer {mob['access_token']}"}
+
+    clock.advance(31.0)  # next TOTP step, valid for both sessions
+    code = service.totp_provisioning_code("alice", clock.now())
+    assert http.post("/auth/sessions/reauthenticate", headers=h_web,
+                     json={"code": code}).status_code == 200
+
+    r = http.post("/auth/sessions/reauthenticate", headers=h_mob,
+                  json={"code": code})
+    assert r.status_code == 409
+    assert r.json()["error"] == "totp_replay"
+
+    # the same body with a wrong code proves the distinction is stable
+    r_wrong = http.post("/auth/sessions/reauthenticate", headers=h_mob,
+                        json={"code": "000000"})
+    assert r_wrong.status_code == 400
+    assert r_wrong.json()["error"] == "totp_invalid"
+
+
 def test_session_endpoints_require_authentication(stack):
     http, _, _ = stack
     assert http.get("/auth/sessions").status_code == 401

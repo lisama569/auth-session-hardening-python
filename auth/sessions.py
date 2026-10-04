@@ -29,7 +29,7 @@ from auth.clock import Clock, SystemClock
 from auth.errors import AuthError, ErrorCode
 from auth.logging_utils import log_decision
 from auth.mfa import TotpResult, TotpVerifier
-from auth.store import RefreshRecord, RefreshState, SessionRecord, Store, UserRecord
+from auth.store import MfaConsumeResult, RefreshRecord, RefreshState, SessionRecord, Store, UserRecord
 from auth.tokens import KeyRing, TokenClaims, b64url_decode
 
 ACCESS_TTL_SECONDS = 300.0                    # 5 minutes
@@ -224,11 +224,12 @@ class SessionService:
             self._challenges.pop(challenge_id, None)
         session = self.store.create_session(user.user_id, challenge.source)
         # The login second factor is the first freshness anchor and its
-        # one-time code is consumed for the new session (cannot later be
-        # replayed as a step-up reauthentication).
+        # one-time code is consumed per-user (so it cannot later be
+        # replayed as a step-up on this or any other session).
         now = self._clock.now()
         consumed_step = self.verifier.step_at(now) + (status.matched_step or 0)
-        self.store.mark_mfa_verified(session.session_id, now, consumed_step)
+        self.store.record_mfa_login(
+            session.session_id, user.user_id, now, consumed_step)
         tokens = self._issue(session)
         log_decision(
             "login.complete", "ok", user=user.user_id, source=challenge.source,
@@ -479,15 +480,26 @@ class SessionService:
         )
         raise AuthError(code=ErrorCode.SESSION_NOT_FOUND)
 
+    def _mfa_code_verified(
+        self, user_id: str, session_id: str, matched_step: int,
+    ) -> None:
+        """Hook invoked after a TOTP code validated, before it is consumed.
+
+        Default no-op; tests override it to create a deterministic
+        concurrency window (a barrier rendezvous) without sleeping or
+        mocking crypto — see ``test_concurrent_reauth_replay.py``.
+        """
+
     def reauthenticate(self, ctx: AccessContext, code: str) -> ReauthResult:
         """Step-up MFA for the caller's current session.
 
         Rules:
         * the same TOTP/MFA gating as login applies (wrong code, clock
           skew, rate limit, lock all remain distinguishable);
-        * a one-time code already consumed for this session (at login or
-          a prior step-up) is rejected as ``totp_replay`` — it can never
-          authorize a second sensitive operation;
+        * a one-time code already consumed by *any* session of this user
+          (at a login or a prior step-up) is rejected as ``totp_replay`` —
+          it can never authorize a second sensitive operation, even from
+          a different device or a simultaneous request;
         * on success the freshness window slides forward to
         ``now + reauth_freshness`` from the new verification instant.
         """
@@ -509,18 +521,25 @@ class SessionService:
         now = self._clock.now()
         matched_step = self.verifier.step_at(now) + (status.matched_step or 0)
 
-        # Consume-check and freshness update are one atomic store move,
-        # so concurrent reauth with the same one-time code has exactly
-        # one winner and cannot slide the window twice.
-        prior = self.store.get_mfa_state(session.session_id)
-        if prior is not None and matched_step in prior[1]:
+        # Test seam: rendezvous point for deterministic concurrency tests.
+        self._mfa_code_verified(user.user_id, session.session_id, matched_step)
+
+        # Replay-check, step consumption and freshness-anchor update are
+        # ONE atomic store move against the per-user consumed-step ledger,
+        # so concurrent or cross-session presentations of the same
+        # one-time code have exactly one winner; the window never slides
+        # twice and a rejected replay writes nothing.
+        outcome = self.store.consume_mfa_step(
+            session.session_id, user.user_id, now, matched_step)
+        if outcome is MfaConsumeResult.STEP_REPLAYED:
+            consumed = self.store.get_consumed_steps(user.user_id)
             log_decision(
                 "session.reauth", "totp_replay", user=user.user_id,
                 session=session.session_id, step=matched_step,
-                consumed_steps=sorted(prior[1]),
+                consumed_steps=sorted(consumed), scope="per_user",
             )
             raise AuthError(code=ErrorCode.TOTP_REPLAY)
-        if not self.store.mark_mfa_verified(session.session_id, now, matched_step):
+        if outcome is MfaConsumeResult.SESSION_GONE:
             # Session vanished/revoked between auth and reauth.
             raise AuthError(code=ErrorCode.SESSION_NOT_FOUND)
 

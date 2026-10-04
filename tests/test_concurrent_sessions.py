@@ -17,6 +17,7 @@ import pytest
 from auth.errors import AuthError, ErrorCode
 from tests.conftest_service import build_service
 from tests.test_concurrent_refresh import BarrierService
+from tests.test_concurrent_reauth_replay import ReauthBarrierService
 from tests.test_sessions import login
 
 
@@ -29,8 +30,19 @@ def _barrier_service():
     return svc, clock
 
 
+def _reauth_gate_service(parties: int):
+    base, clock = build_service(reauth_freshness=40.0)
+    svc = ReauthBarrierService(
+        base.store, base.keyring, base.verifier, base.authorizer, clock,
+        access_ttl=300.0, refresh_ttl=3600.0,
+        reauth_freshness=40.0, parties=parties,
+    )
+    return svc, clock
+
+
 def test_concurrent_reauth_same_code_single_winner_window_once():
-    service, clock = _barrier_service()
+    n = 8
+    service, clock = _reauth_gate_service(n)
     tokens = login(service)                     # consumes TOTP step 0
     ctx = service.authenticate(tokens.access_token)
     clock.advance(31.0)                         # next TOTP step
@@ -48,16 +60,21 @@ def test_concurrent_reauth_same_code_single_winner_window_once():
             with lock:
                 results.append(("err", exc.code))
 
-    threads = [threading.Thread(target=attempt) for _ in range(8)]
+    threads = [threading.Thread(target=attempt) for _ in range(n)]
     for t in threads:
         t.start()
+    # Deterministic: wait until every request has validated its code, then
+    # release them all into the consume decision at the same instant.
+    service.wait_all_validated()
+    service.release()
     for t in threads:
-        t.join(timeout=2.0)
+        t.join(timeout=5.0)
+        assert not t.is_alive(), "reauth thread hung"
 
     oks = [r for r in results if r[0] == "ok"]
     errs = [r[1] for r in results if r[0] == "err"]
     assert len(oks) == 1, results
-    assert errs == [ErrorCode.TOTP_REPLAY] * 7, results
+    assert errs == [ErrorCode.TOTP_REPLAY] * (n - 1), results
     # single slide: exactly one freshness anchor recorded
     assert oks[0][1] == clock.now() + 40.0
     state = service.store.get_mfa_state(ctx.session_id)

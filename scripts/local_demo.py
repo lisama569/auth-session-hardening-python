@@ -83,6 +83,14 @@ def main() -> None:
          http.post("/auth/sessions/reauthenticate", headers=auth, json={"code": code}))
     show("replay same code (409 totp_replay)",
          http.post("/auth/sessions/reauthenticate", headers=auth, json={"code": code}))
+    # the same code presented by ANOTHER live session of the same user is
+    # rejected as a cross-session replay, not a wrong code
+    other = _login(http, base, clock, "alice", "browser2")
+    other_auth = {"Authorization": f"Bearer {other['access_token']}"}
+    show("replay same code from another session (409 totp_replay, cross-session)",
+         http.post("/auth/sessions/reauthenticate", headers=other_auth, json={"code": code}))
+    show("wrong code from that session (400 totp_invalid, distinct reason)",
+         http.post("/auth/sessions/reauthenticate", headers=other_auth, json={"code": "000000"}))
     show("logout-others after reauth",
          http.post("/auth/sessions/logout-others", headers=auth))
 
